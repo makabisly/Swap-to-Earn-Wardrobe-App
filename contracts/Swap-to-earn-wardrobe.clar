@@ -15,6 +15,15 @@
 (define-constant err-user-not-registered (err u106))
 (define-constant err-item-already-exists (err u107))
 (define-constant err-swap-already-exists (err u108))
+(define-constant err-invalid-style-score (err u109))
+
+(define-constant style-match-perfect u100)
+(define-constant style-match-excellent u80)
+(define-constant style-match-good u60)
+(define-constant style-match-fair u40)
+(define-constant style-bonus-multiplier u2)
+(define-constant min-style-score u0)
+(define-constant max-style-score u100)
 
 (define-data-var token-name (string-ascii 32) "SwapReward")
 (define-data-var token-symbol (string-ascii 10) "SWR")
@@ -55,6 +64,30 @@
 
 (define-map user-items principal (list 100 uint))
 (define-map balances principal uint)
+
+(define-map item-style-attributes uint {
+    style-type: (string-ascii 30),
+    color-palette: (string-ascii 30),
+    formality-level: uint,
+    season: (string-ascii 20),
+    trend-score: uint
+})
+
+(define-map user-style-preferences principal {
+    preferred-style: (string-ascii 30),
+    color-harmony: uint,
+    versatility-score: uint,
+    eco-conscious-rating: uint
+})
+
+(define-map swap-style-scores uint {
+    compatibility-score: uint,
+    bonus-earned: uint,
+    match-category: (string-ascii 20)
+})
+
+(define-data-var total-style-matches uint u0)
+(define-data-var perfect-matches uint u0)
 
 (define-public (transfer (amount uint) (sender principal) (recipient principal) (memo (optional (buff 34))))
     (begin
@@ -171,6 +204,7 @@
             (map-set swaps swap-id updated-swap)
             (try! (mint-reward initiator))
             (try! (mint-reward responder))
+            (try! (distribute-style-bonus swap-id initiator responder))
             (try! (update-user-stats initiator))
             (try! (update-user-stats responder))
             (ok true)))))
@@ -227,3 +261,133 @@
 
 (define-read-only (get-reward-amount)
     (ok (var-get reward-per-swap)))
+
+(define-public (set-item-style-attributes
+    (item-id uint)
+    (style-type (string-ascii 30))
+    (color-palette (string-ascii 30))
+    (formality-level uint)
+    (season (string-ascii 20))
+    (trend-score uint))
+    (let ((item (unwrap! (map-get? clothing-items item-id) err-item-not-found)))
+        (asserts! (is-eq (get owner item) tx-sender) err-not-authorized)
+        (asserts! (<= formality-level u10) err-invalid-style-score)
+        (asserts! (<= trend-score u100) err-invalid-style-score)
+        (map-set item-style-attributes item-id {
+            style-type: style-type,
+            color-palette: color-palette,
+            formality-level: formality-level,
+            season: season,
+            trend-score: trend-score
+        })
+        (ok true)))
+
+(define-public (set-user-style-preferences
+    (preferred-style (string-ascii 30))
+    (color-harmony uint)
+    (versatility-score uint)
+    (eco-conscious-rating uint))
+    (begin
+        (asserts! (is-some (map-get? users tx-sender)) err-user-not-registered)
+        (asserts! (<= color-harmony u100) err-invalid-style-score)
+        (asserts! (<= versatility-score u100) err-invalid-style-score)
+        (asserts! (<= eco-conscious-rating u100) err-invalid-style-score)
+        (map-set user-style-preferences tx-sender {
+            preferred-style: preferred-style,
+            color-harmony: color-harmony,
+            versatility-score: versatility-score,
+            eco-conscious-rating: eco-conscious-rating
+        })
+        (ok true)))
+
+(define-private (calculate-style-compatibility (item1-id uint) (item2-id uint))
+    (match (map-get? item-style-attributes item1-id)
+        item1-style
+        (match (map-get? item-style-attributes item2-id)
+            item2-style
+            (let (
+                (formality-diff (if (> (get formality-level item1-style) (get formality-level item2-style))
+                                    (- (get formality-level item1-style) (get formality-level item2-style))
+                                    (- (get formality-level item2-style) (get formality-level item1-style))))
+                (trend-avg (/ (+ (get trend-score item1-style) (get trend-score item2-style)) u2))
+                (season-match (if (is-eq (get season item1-style) (get season item2-style)) u20 u0))
+                (style-match (if (is-eq (get style-type item1-style) (get style-type item2-style)) u30 u10))
+                (color-match (if (is-eq (get color-palette item1-style) (get color-palette item2-style)) u20 u10))
+            )
+                (let ((base-score (+ (+ (+ style-match color-match) season-match) trend-avg)))
+                    (if (<= formality-diff u2)
+                        (if (> base-score u90) style-match-perfect
+                            (if (> base-score u70) style-match-excellent
+                                (if (> base-score u50) style-match-good style-match-fair)))
+                        (if (> base-score u60) style-match-good style-match-fair))))
+            u40)
+        u40))
+
+(define-private (calculate-style-bonus (compatibility-score uint) (base-reward uint))
+    (if (>= compatibility-score style-match-excellent)
+        (/ (* base-reward (* style-bonus-multiplier compatibility-score)) u100)
+        (if (>= compatibility-score style-match-good)
+            (/ (* base-reward compatibility-score) u100)
+            u0)))
+
+(define-private (distribute-style-bonus (swap-id uint) (initiator principal) (responder principal))
+    (match (map-get? swaps swap-id)
+        swap-data
+        (let (
+            (compatibility (calculate-style-compatibility 
+                           (get initiator-item swap-data) 
+                           (get responder-item swap-data)))
+            (bonus-amount (calculate-style-bonus compatibility (var-get reward-per-swap)))
+        )
+            (if (> bonus-amount u0)
+                (begin
+                    (map-set swap-style-scores swap-id {
+                        compatibility-score: compatibility,
+                        bonus-earned: bonus-amount,
+                        match-category: (if (>= compatibility style-match-excellent) "excellent" 
+                                          (if (>= compatibility style-match-good) "good" "fair"))
+                    })
+                    (var-set total-style-matches (+ (var-get total-style-matches) u1))
+                    (if (>= compatibility style-match-perfect)
+                        (var-set perfect-matches (+ (var-get perfect-matches) u1))
+                        true)
+                    (try! (ft-mint? swap-reward bonus-amount initiator))
+                    (try! (ft-mint? swap-reward bonus-amount responder))
+                    (ok u0))
+                (ok u0)))
+        (ok u0)))
+
+(define-read-only (get-style-compatibility-score (item1-id uint) (item2-id uint))
+    (ok (calculate-style-compatibility item1-id item2-id)))
+
+(define-read-only (get-swap-style-score (swap-id uint))
+    (map-get? swap-style-scores swap-id))
+
+(define-read-only (get-item-style-attributes (item-id uint))
+    (map-get? item-style-attributes item-id))
+
+(define-read-only (get-user-style-preferences (user principal))
+    (map-get? user-style-preferences user))
+
+(define-read-only (get-style-match-stats)
+    (ok {
+        total-matches: (var-get total-style-matches),
+        perfect-matches: (var-get perfect-matches),
+        perfect-ratio: (if (> (var-get total-style-matches) u0)
+                         (/ (* (var-get perfect-matches) u100) (var-get total-style-matches))
+                         u0)
+    }))
+
+(define-read-only (preview-swap-bonus (item1-id uint) (item2-id uint))
+    (let (
+        (compatibility (calculate-style-compatibility item1-id item2-id))
+        (potential-bonus (calculate-style-bonus compatibility (var-get reward-per-swap)))
+    )
+        (ok {
+            compatibility-score: compatibility,
+            potential-bonus: potential-bonus,
+            match-level: (if (>= compatibility style-match-perfect) "perfect"
+                           (if (>= compatibility style-match-excellent) "excellent"
+                             (if (>= compatibility style-match-good) "good" 
+                               (if (>= compatibility style-match-fair) "fair" "low"))))
+        })))
