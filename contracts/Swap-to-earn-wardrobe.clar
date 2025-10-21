@@ -15,6 +15,12 @@
 (define-constant err-user-not-registered (err u106))
 (define-constant err-item-already-exists (err u107))
 (define-constant err-swap-already-exists (err u108))
+(define-constant err-swap-not-completed (err u109))
+(define-constant err-already-rated (err u110))
+(define-constant err-invalid-rating (err u111))
+(define-constant err-cannot-rate-self (err u112))
+(define-constant err-user-already-registered (err u113))
+(define-constant err-max-items-reached (err u114))
 
 (define-data-var token-name (string-ascii 32) "SwapReward")
 (define-data-var token-symbol (string-ascii 10) "SWR")
@@ -56,6 +62,23 @@
 (define-map user-items principal (list 100 uint))
 (define-map balances principal uint)
 
+(define-map swap-ratings {swap-id: uint, rater: principal} {
+    rating: uint,
+    review: (string-ascii 500),
+    rated-user: principal,
+    created-at: uint
+})
+
+(define-map user-rating-stats principal {
+    total-ratings: uint,
+    sum-ratings: uint,
+    five-star: uint,
+    four-star: uint,
+    three-star: uint,
+    two-star: uint,
+    one-star: uint
+})
+
 (define-public (transfer (amount uint) (sender principal) (recipient principal) (memo (optional (buff 34))))
     (begin
         (asserts! (or (is-eq tx-sender sender) (is-eq contract-caller sender)) err-not-authorized)
@@ -89,7 +112,7 @@
         total-swaps: u0,
         joined-at: stacks-block-height
     }))
-    (asserts! (is-none (map-get? users tx-sender)) (err u109))
+    (asserts! (is-none (map-get? users tx-sender)) err-user-already-registered)
     (map-set users tx-sender user-data)
     (map-set user-items tx-sender (list))
     (ok true)))
@@ -116,7 +139,7 @@
     (asserts! (is-some (map-get? users tx-sender)) err-user-not-registered)
     (map-set clothing-items item-id item-data)
     (let ((current-items (default-to (list) (map-get? user-items tx-sender))))
-        (map-set user-items tx-sender (unwrap! (as-max-len? (append current-items item-id) u100) (err u110))))
+        (map-set user-items tx-sender (unwrap! (as-max-len? (append current-items item-id) u100) err-max-items-reached)))
     (var-set next-item-id (+ item-id u1))
     (ok item-id)))
 
@@ -227,3 +250,81 @@
 
 (define-read-only (get-reward-amount)
     (ok (var-get reward-per-swap)))
+
+(define-public (rate-swap-partner (swap-id uint) (rating uint) (review (string-ascii 500)))
+    (let ((swap-data (unwrap! (map-get? swaps swap-id) err-swap-not-found))
+          (initiator (get initiator swap-data))
+          (responder (get responder swap-data)))
+    (asserts! (is-eq (get status swap-data) "completed") err-swap-not-completed)
+    (asserts! (or (is-eq tx-sender initiator) (is-eq tx-sender responder)) err-not-authorized)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (asserts! (is-none (map-get? swap-ratings {swap-id: swap-id, rater: tx-sender})) err-already-rated)
+    (let ((rated-user (if (is-eq tx-sender initiator) responder initiator)))
+        (asserts! (not (is-eq tx-sender rated-user)) err-cannot-rate-self)
+        (map-set swap-ratings {swap-id: swap-id, rater: tx-sender} {
+            rating: rating,
+            review: review,
+            rated-user: rated-user,
+            created-at: stacks-block-height
+        })
+        (unwrap-panic (update-rating-stats rated-user rating))
+        (ok true))))
+
+(define-private (update-rating-stats (user principal) (rating uint))
+    (let ((current-stats (default-to {
+            total-ratings: u0,
+            sum-ratings: u0,
+            five-star: u0,
+            four-star: u0,
+            three-star: u0,
+            two-star: u0,
+            one-star: u0
+        } (map-get? user-rating-stats user))))
+    (map-set user-rating-stats user {
+        total-ratings: (+ (get total-ratings current-stats) u1),
+        sum-ratings: (+ (get sum-ratings current-stats) rating),
+        five-star: (+ (get five-star current-stats) (if (is-eq rating u5) u1 u0)),
+        four-star: (+ (get four-star current-stats) (if (is-eq rating u4) u1 u0)),
+        three-star: (+ (get three-star current-stats) (if (is-eq rating u3) u1 u0)),
+        two-star: (+ (get two-star current-stats) (if (is-eq rating u2) u1 u0)),
+        one-star: (+ (get one-star current-stats) (if (is-eq rating u1) u1 u0))
+    })
+    (ok true)))
+
+(define-read-only (get-swap-rating (swap-id uint) (rater principal))
+    (map-get? swap-ratings {swap-id: swap-id, rater: rater}))
+
+(define-read-only (get-user-rating-stats (user principal))
+    (map-get? user-rating-stats user))
+
+(define-read-only (get-user-average-rating (user principal))
+    (match (map-get? user-rating-stats user)
+        stats 
+        (if (> (get total-ratings stats) u0)
+            (ok (/ (* (get sum-ratings stats) u100) (get total-ratings stats)))
+            (ok u0))
+        (ok u0)))
+
+(define-read-only (get-user-rating-breakdown (user principal))
+    (match (map-get? user-rating-stats user)
+        stats
+        (ok {
+            total-ratings: (get total-ratings stats),
+            average-rating: (if (> (get total-ratings stats) u0)
+                (/ (* (get sum-ratings stats) u100) (get total-ratings stats))
+                u0),
+            five-star: (get five-star stats),
+            four-star: (get four-star stats),
+            three-star: (get three-star stats),
+            two-star: (get two-star stats),
+            one-star: (get one-star stats)
+        })
+        (ok {
+            total-ratings: u0,
+            average-rating: u0,
+            five-star: u0,
+            four-star: u0,
+            three-star: u0,
+            two-star: u0,
+            one-star: u0
+        })))
